@@ -6,6 +6,7 @@ import pprint
 import torch.nn.functional as F
 from typing import Optional, Union
 from huggingface_hub import hf_hub_download
+import einops
 
 from typing import NamedTuple
 
@@ -209,3 +210,152 @@ class CrossCoder(nn.Module):
         self = cls(cfg=cfg)
         self.load_state_dict(torch.load(weight_path))
         return self
+
+
+class MatryoshkaCrossCoder(nn.Module):
+    """
+    A CrossCoder variant that implements Matryoshka training style.
+    The dictionary is partitioned into groups as specified in cfg["group_sizes"].
+    In the forward pass, partial reconstructions are computed and accumulated,
+    and the final loss is the average MSE over all partial reconstructions.
+    """
+    def __init__(self, cfg):
+        super().__init__()
+        self.cfg = cfg
+        self.group_sizes = cfg["group_sizes"]
+        total_dict_size = sum(self.group_sizes)
+        # Create group indices for slicing: e.g., [0, group_sizes[0], group_sizes[0]+group_sizes[1], ...]
+        self.group_indices = [0] + list(torch.cumsum(torch.tensor(self.group_sizes), dim=0))
+ 
+        d_in = cfg["d_in"]
+        self.dtype = DTYPES[cfg["enc_dtype"]]
+        torch.manual_seed(cfg["seed"])
+ 
+        # Define encoder and decoder with total dictionary size = sum(group_sizes)
+        self.W_enc = nn.Parameter(
+            torch.empty(2, d_in, total_dict_size, dtype=self.dtype)
+        )
+        self.W_dec = nn.Parameter(
+            torch.empty(total_dict_size, 2, d_in, dtype=self.dtype)
+        )
+        self.b_enc = nn.Parameter(torch.zeros(total_dict_size, dtype=self.dtype))
+        self.b_dec = nn.Parameter(torch.zeros((2, d_in), dtype=self.dtype))
+ 
+        with torch.no_grad():
+            # Initialize W_dec with a scaled normal distribution
+            self.W_dec[:] = torch.randn_like(self.W_dec) * cfg.get("dec_init_norm", 0.08)
+            self.W_dec[:] = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True) * cfg.get("dec_init_norm", 0.08)
+            # Set W_enc as the transpose (using einops rearrange)
+            self.W_enc[:] = einops.rearrange(
+                self.W_dec.clone(),
+                "dict_size n_models d_in -> n_models d_in dict_size",
+            )
+ 
+        self.d_hidden = total_dict_size
+        self.to(cfg["device"])
+        self.save_dir = None
+        self.save_version = 0
+ 
+    def encode(self, x, apply_relu=True):
+        """
+        Encode input x.
+        x: [batch, 2, d_in]
+        Returns: encoded activations of shape [batch, total_dict_size]
+        """
+        x_enc = einops.einsum(
+            x,
+            self.W_enc,
+            "batch n_models d_in, n_models d_in d_hidden -> batch d_hidden",
+        )
+        if apply_relu:
+            acts = F.relu(x_enc + self.b_enc)
+        else:
+            acts = x_enc + self.b_enc
+        return acts
+ 
+    def forward(self, x):
+        """
+        Performs incremental decoding in a Matryoshka manner.
+        Returns a list of partial reconstructions (each of shape [batch, 2, d_in]).
+        Each successive reconstruction accumulates one more group.
+        """
+        acts = self.encode(x)  # [batch, total_dict_size]
+        partial_recons = []
+        # Initialize current reconstruction to zeros (optionally, you might add a bias here)
+        current_recon = torch.zeros_like(x, dtype=acts.dtype, device=acts.device)
+ 
+        for i in range(len(self.group_sizes)):
+            start_idx = self.group_indices[i]
+            end_idx = self.group_indices[i+1]
+ 
+            # Extract the latent activations for the current group
+            acts_slice = acts[:, start_idx:end_idx]  # [batch, group_size]
+            # Extract the corresponding slice of decoder weights
+            W_dec_slice = self.W_dec[start_idx:end_idx, :, :]  # [group_size, 2, d_in]
+ 
+            # Compute partial reconstruction for this group
+            recon_slice = einops.einsum(
+                acts_slice, W_dec_slice,
+                "batch g_size, g_size n_models d_in -> batch n_models d_in",
+            )
+            current_recon = current_recon + recon_slice
+            partial_recons.append(current_recon.clone())
+ 
+        return partial_recons
+ 
+    def get_losses(self, x):
+        """
+        Computes the loss as the average MSE over all partial reconstructions.
+        """
+        x = x.to(self.dtype)
+        partial_recons = self.forward(x)  # List of [batch, 2, d_in]
+        loss_accum = 0.0
+        for pr in partial_recons:
+            loss_accum += F.mse_loss(pr, x)
+        l2_loss = loss_accum / len(partial_recons)
+ 
+        # You can add L1 or L0 penalties here if desired; for now we set them to zero.
+        l1_loss = torch.tensor(0.0, device=x.device)
+        l0_loss = torch.tensor(0.0, device=x.device)
+ 
+        # Optionally, compute explained variance (set to 0 here for brevity)
+        explained_variance = torch.tensor(0.0, device=x.device)
+        explained_variance_A = torch.tensor(0.0, device=x.device)
+        explained_variance_B = torch.tensor(0.0, device=x.device)
+ 
+        return LossOutput(
+            l2_loss=l2_loss,
+            l1_loss=l1_loss,
+            l0_loss=l0_loss,
+            explained_variance=explained_variance,
+            explained_variance_A=explained_variance_A,
+            explained_variance_B=explained_variance_B,
+        )
+ 
+    def save(self):
+        if self.save_dir is None:
+            self.create_save_dir()
+        weight_path = self.save_dir / f"{self.save_version}.pt"
+        cfg_path = self.save_dir / f"{self.save_version}_cfg.json"
+ 
+        torch.save(self.state_dict(), weight_path)
+        with open(cfg_path, "w") as f:
+            json.dump(self.cfg, f)
+ 
+        print(f"Saved as version {self.save_version} in {self.save_dir}")
+        self.save_version += 1
+ 
+    def create_save_dir(self):
+        from pathlib import Path
+        base_dir = Path("/workspace/crosscoder-model-diff-replication/checkpoints")
+        version_list = [
+            int(file.name.split("_")[1])
+            for file in list(base_dir.iterdir())
+            if "version" in str(file)
+        ]
+        if len(version_list):
+            version = 1 + max(version_list)
+        else:
+            version = 0
+        self.save_dir = base_dir / f"version_{version}"
+        self.save_dir.mkdir(parents=True)

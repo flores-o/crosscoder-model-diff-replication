@@ -1,0 +1,13 @@
+torch
+torchvision
+torchaudio
+transformer-lens
+datasets
+plotly
+wandb
+einops
+numpy
+pandas
+tqdm
+ipython
+huggingface-hub

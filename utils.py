@@ -194,3 +194,33 @@ def load_pile_lmsys_mixed_tokens():
         torch.save(all_tokens, "/workspace/data/pile-lmsys-mix-1m-tokenized-gemma-2.pt")
         print(f"Saved tokens to disk")
     return all_tokens
+
+def create_save_dir(self):
+    base_dir = Path("/workspace/crosscoder-model-diff-replication/checkpoints")
+    print(f"Creating save directory in {base_dir}")
+    version_list = [
+        int(file.name.split("_")[1])
+        for file in list(SAVE_DIR.iterdir())
+        if "version" in str(file)
+    ]
+    if len(version_list):
+        version = 1 + max(version_list)
+    else:
+        version = 0
+    self.save_dir = base_dir / f"version_{version}"
+    self.save_dir.mkdir(parents=True)
+    print(f"Save directory created: {self.save_dir}")
+
+def save(self):
+    if self.save_dir is None:
+        self.create_save_dir()
+    weight_path = self.save_dir / f"{self.save_version}.pt"
+    cfg_path = self.save_dir / f"{self.save_version}_cfg.json"
+
+    print(f"Saving weights to {weight_path}")
+    torch.save(self.state_dict(), weight_path)
+    with open(cfg_path, "w") as f:
+        json.dump(self.cfg, f)
+
+    print(f"Saved as version {self.save_version} in {self.save_dir}")
+    self.save_version += 1

@@ -9,9 +9,27 @@ class Trainer:
         self.cfg = cfg
         self.model_A = model_A
         self.model_B = model_B
-        self.crosscoder = CrossCoder(cfg)
+        # Use MatryoshkaCrossCoder if the flag is enabled
+        if cfg.get("matryoshka", False):
+            from crosscoder import MatryoshkaCrossCoder
+            self.crosscoder = MatryoshkaCrossCoder(cfg)
+        else:
+            from crosscoder import CrossCoder
+            self.crosscoder = CrossCoder(cfg)
+
         self.buffer = Buffer(cfg, model_A, model_B, all_tokens)
+        # Define total_steps so lr_lambda can reference it.
+        # For instance, approximate total steps as:
+        #   num_tokens // batch_size
         self.total_steps = cfg["num_tokens"] // cfg["batch_size"]
+
+        # Provide a wandb run name to distinguish Matryoshka runs
+        run_name = "MatryoshkaCrossCoder" if cfg.get("matryoshka", False) else "CrossCoder"
+        wandb.init(
+            project=cfg["wandb_project"],
+            entity=cfg["wandb_entity"],
+            name=run_name
+        )
 
         self.optimizer = torch.optim.Adam(
             self.crosscoder.parameters(),
@@ -22,8 +40,6 @@ class Trainer:
             self.optimizer, self.lr_lambda
         )
         self.step_counter = 0
-
-        wandb.init(project=cfg["wandb_project"], entity=cfg["wandb_entity"])
 
     def lr_lambda(self, step):
         if step < 0.8 * self.total_steps:
