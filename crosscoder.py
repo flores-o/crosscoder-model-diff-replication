@@ -304,25 +304,27 @@ class MatryoshkaCrossCoder(nn.Module):
         return partial_recons
  
     def get_losses(self, x):
-        """
-        Computes the loss as the average MSE over all partial reconstructions.
-        """
         x = x.to(self.dtype)
         partial_recons = self.forward(x)  # List of [batch, 2, d_in]
         loss_accum = 0.0
         for pr in partial_recons:
             loss_accum += F.mse_loss(pr, x)
         l2_loss = loss_accum / len(partial_recons)
- 
-        # You can add L1 or L0 penalties here if desired; for now we set them to zero.
-        l1_loss = torch.tensor(0.0, device=x.device)
-        l0_loss = torch.tensor(0.0, device=x.device)
- 
-        # Optionally, compute explained variance (set to 0 here for brevity)
+
+        # Compute L1 loss similar to CrossCoder: multiply activations by the sum of decoder norms
+        acts = self.encode(x)
+        decoder_norms = self.W_dec.norm(dim=-1)  # shape: [total_dict_size, n_models]
+        total_decoder_norm = einops.reduce(decoder_norms, 'd_hidden n_models -> d_hidden', 'sum')
+        l1_loss = (acts * total_decoder_norm[None, :]).sum(-1).mean(0)
+
+        # Compute L0 loss as the average number of nonzero activations per token
+        l0_loss = (acts > 0).float().sum(-1).mean()
+
+        # Optionally, compute explained variance (set to zero here)
         explained_variance = torch.tensor(0.0, device=x.device)
         explained_variance_A = torch.tensor(0.0, device=x.device)
         explained_variance_B = torch.tensor(0.0, device=x.device)
- 
+
         return LossOutput(
             l2_loss=l2_loss,
             l1_loss=l1_loss,
@@ -331,6 +333,7 @@ class MatryoshkaCrossCoder(nn.Module):
             explained_variance_A=explained_variance_A,
             explained_variance_B=explained_variance_B,
         )
+
  
     def save(self):
         if self.save_dir is None:
