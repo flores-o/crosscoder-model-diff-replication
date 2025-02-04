@@ -320,10 +320,22 @@ class MatryoshkaCrossCoder(nn.Module):
         # Compute L0 loss as the average number of nonzero activations per token
         l0_loss = (acts > 0).float().sum(-1).mean()
 
-        # Optionally, compute explained variance (set to zero here)
-        explained_variance = torch.tensor(0.0, device=x.device)
-        explained_variance_A = torch.tensor(0.0, device=x.device)
-        explained_variance_B = torch.tensor(0.0, device=x.device)
+        # Compute explained variance using the final (full) reconstruction.
+        x_reconstruct_final = partial_recons[-1]
+        diff = x_reconstruct_final.float() - x.float()
+        squared_diff = diff.pow(2)
+        l2_per_batch = einops.reduce(squared_diff, 'batch n_models d_in -> batch', 'sum')
+        total_variance = einops.reduce((x - x.mean(0)).pow(2), 'batch n_models d_in -> batch', 'sum')
+        explained_variance = 1 - l2_per_batch / total_variance
+
+        per_token_l2_loss_A = (x_reconstruct_final[:, 0, :] - x[:, 0, :]).pow(2).sum(dim=-1)
+        total_variance_A = (x[:, 0, :] - x[:, 0, :].mean(0)).pow(2).sum(-1)
+        explained_variance_A = 1 - per_token_l2_loss_A / total_variance_A
+
+        per_token_l2_loss_B = (x_reconstruct_final[:, 1, :] - x[:, 1, :]).pow(2).sum(dim=-1)
+        total_variance_B = (x[:, 1, :] - x[:, 1, :].mean(0)).pow(2).sum(-1)
+        explained_variance_B = 1 - per_token_l2_loss_B / total_variance_B
+
 
         return LossOutput(
             l2_loss=l2_loss,
