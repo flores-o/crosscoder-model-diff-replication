@@ -9,9 +9,27 @@ class Trainer:
         self.cfg = cfg
         self.model_A = model_A
         self.model_B = model_B
-        self.crosscoder = CrossCoder(cfg)
+        
+        # Use MatryoshkaCrossCoder if the flag is enabled
+        if cfg.get("matryoshka", True):
+            from crosscoder import MatryoshkaCrossCoderV2
+            self.crosscoder = MatryoshkaCrossCoderV2(cfg)
+        else:
+            from crosscoder import CrossCoder
+            self.crosscoder = CrossCoder(cfg)
+
         self.buffer = Buffer(cfg, model_A, model_B, all_tokens)
         self.total_steps = cfg["num_tokens"] // cfg["batch_size"]
+
+        
+        # Provide a wandb run name to distinguish Matryoshka runs
+        run_name = "MatryoshkaCrossCoderV2" if cfg.get("matryoshka", True) else "CrossCoder"
+        wandb.init(
+            project=cfg["wandb_project"],
+            entity=cfg["wandb_entity"],
+            name=run_name
+        )
+
 
         self.optimizer = torch.optim.Adam(
             self.crosscoder.parameters(),

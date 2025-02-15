@@ -10,7 +10,7 @@ from huggingface_hub import hf_hub_download
 from typing import NamedTuple
 
 DTYPES = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
-SAVE_DIR = Path("/workspace/crosscoder-model-diff-replication/checkpoints")
+SAVE_DIR = Path("/root/interp/crosscoder-model-diff-replication/checkpoints")
 
 class LossOutput(NamedTuple):
     # loss: torch.Tensor
@@ -125,7 +125,7 @@ class CrossCoder(nn.Module):
         return LossOutput(l2_loss=l2_loss, l1_loss=l1_loss, l0_loss=l0_loss, explained_variance=explained_variance, explained_variance_A=explained_variance_A, explained_variance_B=explained_variance_B)
 
     def create_save_dir(self):
-        base_dir = Path("/workspace/crosscoder-model-diff-replication/checkpoints")
+        base_dir = Path("/root/interp/crosscoder-model-diff-replication/checkpoints")
         version_list = [
             int(file.name.split("_")[1])
             for file in list(SAVE_DIR.iterdir())
@@ -200,7 +200,7 @@ class CrossCoder(nn.Module):
 
     @classmethod
     def load(cls, version_dir, checkpoint_version):
-        save_dir = Path("/workspace/crosscoder-model-diff-replication/checkpoints") / str(version_dir)
+        save_dir = Path("/root/interp/crosscoder-model-diff-replication/checkpoints") / str(version_dir)
         cfg_path = save_dir / f"{str(checkpoint_version)}_cfg.json"
         weight_path = save_dir / f"{str(checkpoint_version)}.pt"
 
@@ -209,3 +209,95 @@ class CrossCoder(nn.Module):
         self = cls(cfg=cfg)
         self.load_state_dict(torch.load(weight_path))
         return self
+
+
+class MatryoshkaCrossCoderV2(CrossCoder):
+    def __init__(self, cfg):
+        # Overwrite the flat dictionary size with the sum over group_sizes.
+        total_hidden = sum(cfg["group_sizes"])  # total_hidden becomes, e.g., 4096+4096+8192
+        cfg = dict(cfg)
+        cfg["dict_size"] = total_hidden         # Override flat dict size with total nested size
+        super().__init__(cfg)  # This will now create W_enc of shape [2, d_in, total_hidden]
+        
+        # Save the group configuration and compute group boundaries (indices)
+        self.group_sizes = cfg["group_sizes"]
+        # e.g. group_indices = [0, 4096, 4096+4096, 4096+4096+8192]
+        self.group_indices = [0] + list(torch.tensor(self.group_sizes).cumsum(dim=0).tolist())
+
+    def decode_nested(self, acts):
+        """
+        Computes intermediate reconstructions over nested groups.
+        Returns a list of reconstructions, where the final one is the sum of all groups.
+        """
+        batch = acts.shape[0]
+        # Start with the bias (broadcasted to [batch, 2, d_model])
+        current_reconstruction = self.b_dec.unsqueeze(0).expand(batch, -1, -1)
+        nested_recs = []
+        # Loop over each group defined by self.group_indices
+        for i in range(len(self.group_sizes)):
+            start = self.group_indices[i]
+            end = self.group_indices[i+1]
+            # Slice the latent activations for the current group.
+            acts_group = acts[:, start:end]  # shape: [batch, group_size]
+            # And select the corresponding decoder slice (shape: [group_size, 2, d_model])
+            W_dec_group = self.W_dec[start:end]
+            # Compute this group’s reconstruction contribution:
+            rec_group = einops.einsum(acts_group, W_dec_group, "batch group_size, group_size n_models d_model -> batch n_models d_model")
+            # Add it to the accumulated reconstruction:
+            current_reconstruction = current_reconstruction + rec_group
+            nested_recs.append(current_reconstruction)
+        return nested_recs
+
+    def decode(self, acts):
+        # For compatibility, return the final reconstruction (using all groups)
+        nested_recs = self.decode_nested(acts)
+        return nested_recs[-1]
+
+    def get_losses(self, x):
+        x = x.to(self.dtype)
+        acts = self.encode(x)  # shape: [batch, total_hidden]
+        nested_recs = self.decode_nested(acts)  # list of [batch, n_models, d_model]
+        
+        # Compute l2 loss for each nested reconstruction and sum them.
+        l2_losses = []
+        for rec in nested_recs:
+            diff = rec.float() - x.float()
+            squared_diff = diff.pow(2)
+            l2_loss_group = squared_diff.sum(dim=[1,2]).mean()
+            l2_losses.append(l2_loss_group)
+        l2_loss = sum(l2_losses)  # you may want to weight each group differently
+        
+        # (Optional) Reuse the same computation of l1_loss and l0_loss as before.
+        decoder_norms = self.W_dec.norm(dim=-1)  # shape: [total_hidden, n_models]
+        total_decoder_norm = decoder_norms.sum(dim=1)
+        l1_loss = (acts * total_decoder_norm[None, :]).sum(-1).mean()
+        l0_loss = (acts > 0).float().sum(-1).mean()
+
+        # Compute explained variance on the final reconstruction
+        final_rec = nested_recs[-1]
+        diff_final = final_rec.float() - x.float()
+        l2_final = diff_final.pow(2).sum(dim=[1,2])
+        total_var = (x - x.mean(0)).pow(2).sum(dim=[1,2])
+        explained_variance = 1 - l2_final / total_var
+
+        # For per-model variance (A/B), repeat as needed…
+        # (See the original implementation for per-model explained variance.)
+        # Compute explained variance for model A
+        per_token_l2_loss_A = (final_rec[:, 0, :] - x[:, 0, :]).pow(2).sum(dim=-1).squeeze()
+        total_variance_A = (x[:, 0, :] - x[:, 0, :].mean(0)).pow(2).sum(dim=-1).squeeze()
+        explained_variance_A = 1 - per_token_l2_loss_A / total_variance_A
+
+        # Compute explained variance for model B
+        per_token_l2_loss_B = (final_rec[:, 1, :] - x[:, 1, :]).pow(2).sum(dim=-1).squeeze()
+        total_variance_B = (x[:, 1, :] - x[:, 1, :].mean(0)).pow(2).sum(dim=-1).squeeze()
+        explained_variance_B = 1 - per_token_l2_loss_B / total_variance_B
+
+        return LossOutput(
+            l2_loss=l2_loss,
+            l1_loss=l1_loss,
+            l0_loss=l0_loss,
+            explained_variance=explained_variance,
+            explained_variance_A=explained_variance_A,  # placeholder
+            explained_variance_B=explained_variance_B   # placeholder
+        )
+
