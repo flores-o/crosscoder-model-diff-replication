@@ -1,4 +1,3 @@
-
 from utils import *
 
 from torch import nn
@@ -8,9 +7,10 @@ from typing import Optional, Union
 from huggingface_hub import hf_hub_download
 
 from typing import NamedTuple
+from transformers import AutoModel
 
 DTYPES = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}
-SAVE_DIR = Path("/root/interp/crosscoder-model-diff-replication/checkpoints")
+SAVE_DIR = Path("/workspace/crosscoder-model-diff-replication/checkpoints")
 
 class LossOutput(NamedTuple):
     # loss: torch.Tensor
@@ -125,7 +125,7 @@ class CrossCoder(nn.Module):
         return LossOutput(l2_loss=l2_loss, l1_loss=l1_loss, l0_loss=l0_loss, explained_variance=explained_variance, explained_variance_A=explained_variance_A, explained_variance_B=explained_variance_B)
 
     def create_save_dir(self):
-        base_dir = Path("/root/interp/crosscoder-model-diff-replication/checkpoints")
+        base_dir = Path("/workspace/crosscoder-model-diff-replication/checkpoints")
         version_list = [
             int(file.name.split("_")[1])
             for file in list(SAVE_DIR.iterdir())
@@ -149,6 +149,7 @@ class CrossCoder(nn.Module):
             json.dump(self.cfg, f)
 
         print(f"Saved as version {self.save_version} in {self.save_dir}")
+
         self.save_version += 1
 
     @classmethod
@@ -200,7 +201,7 @@ class CrossCoder(nn.Module):
 
     @classmethod
     def load(cls, version_dir, checkpoint_version):
-        save_dir = Path("/root/interp/crosscoder-model-diff-replication/checkpoints") / str(version_dir)
+        save_dir = Path("/workspace/crosscoder-model-diff-replication") / str(version_dir)
         cfg_path = save_dir / f"{str(checkpoint_version)}_cfg.json"
         weight_path = save_dir / f"{str(checkpoint_version)}.pt"
 
@@ -241,7 +242,7 @@ class MatryoshkaCrossCoderV2(CrossCoder):
             acts_group = acts[:, start:end]  # shape: [batch, group_size]
             # And select the corresponding decoder slice (shape: [group_size, 2, d_model])
             W_dec_group = self.W_dec[start:end]
-            # Compute this group’s reconstruction contribution:
+            # Compute this group's reconstruction contribution:
             rec_group = einops.einsum(acts_group, W_dec_group, "batch group_size, group_size n_models d_model -> batch n_models d_model")
             # Add it to the accumulated reconstruction:
             current_reconstruction = current_reconstruction + rec_group
